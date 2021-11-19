@@ -1498,6 +1498,7 @@ dependencies = [
  "glob",
  "image",
  "legion",
+ "log",
  "nalgebra",
  "num-traits",
  "rayon",

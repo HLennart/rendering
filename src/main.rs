@@ -1,7 +1,8 @@
+use anyhow::Context;
 use cgmath::prelude::*;
-use legion::{IntoQuery, Read, Write};
+use legion::{system, IntoQuery, Query, Write};
+use log::error;
 use rayon::prelude::*;
-use std::iter;
 use wgpu::util::DeviceExt;
 use winit::{
     event::*,
@@ -38,6 +39,8 @@ struct InstanceInformation {
     instance_buffer: wgpu::Buffer,
 }
 
+type CameraRenderInformation = (CameraUniform, CameraBuffer, CameraBindGroup);
+
 impl CameraUniform {
     fn new() -> Self {
         Self {
@@ -48,8 +51,6 @@ impl CameraUniform {
 
     fn update_view_proj(&mut self, camera: &camera::Camera, projection: &camera::Projection) {
         self.view_position = camera.position.to_homogeneous().into();
-
-
 
         self.view_proj = (projection.calc_matrix() * camera.calc_matrix()).into()
     }
@@ -138,25 +139,17 @@ struct LightUniform {
     color: [f32; 3],
 }
 
+struct CameraBuffer(wgpu::Buffer);
+struct CameraBindGroup(wgpu::BindGroup);
+
 struct State {
-    surface: wgpu::Surface,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    render_pipeline: wgpu::RenderPipeline,
-    obj_model: model::Model,
-    camera: camera::Camera,
-    projection: camera::Projection,
-    camera_controller: camera::CameraController,
-    camera_uniform: CameraUniform,
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
-    depth_texture: texture::Texture,
     size: winit::dpi::PhysicalSize<u32>,
     #[allow(dead_code)]
     debug_material: model::Material,
     mouse_pressed: bool,
     world: legion::World,
+    resources: legion::Resources,
 }
 
 fn create_render_pipeline(
@@ -300,10 +293,8 @@ impl State {
                 label: Some("texture_bind_group_layout"),
             });
 
-
         let camera = camera::Camera::new([0.0, 5.0, 10.0], cgmath::Deg(-90.0), cgmath::Deg(-20.0));
-        let projection =
-            camera::Projection::new(config.width, config.height, 45.0, 0.1, 100.0);
+        let projection = camera::Projection::new(config.width, config.height, 45.0, 0.1, 100.0);
         let camera_controller = camera::CameraController::new(4.0, 0.4);
 
         let mut camera_uniform = CameraUniform::new();
@@ -495,66 +486,96 @@ impl State {
         };
 
         let mut world = legion::World::default();
+        let mut resources = legion::Resources::default();
 
-        world.push((
-            LightInformation {
-                light_uniform,
-                light_buffer,
-                light_bind_group,
-                light_render_pipeline
-            },
+        resources.insert(camera);
+        resources.insert(camera_controller);
+        resources.insert(projection);
+        resources.insert((
+            camera_uniform,
+            CameraBuffer(camera_buffer),
+            CameraBindGroup(camera_bind_group),
         ));
+        resources.insert(queue);
+        resources.insert(surface);
+        resources.insert(device);
+        resources.insert(depth_texture);
+        resources.insert(render_pipeline);
+
+        let obj_model_id = world.push((obj_model,));
+
+        world.push((LightInformation {
+            light_uniform,
+            light_buffer,
+            light_bind_group,
+            light_render_pipeline,
+        },));
 
         world.push((
             InstanceInformation {
                 instances,
-                instance_buffer
+                instance_buffer,
             },
+            obj_model_id,
         ));
 
         Self {
-            surface,
-            device,
-            queue,
             config,
-            render_pipeline,
-            obj_model,
-            camera,
-            projection,
-            camera_controller,
-            camera_buffer,
-            camera_bind_group,
-            camera_uniform,
-            depth_texture,
             size,
             #[allow(dead_code)]
             debug_material,
             mouse_pressed: false,
-            world
+            world,
+            resources,
         }
     }
 
     fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
-            self.projection.resize(new_size.width, new_size.height);
+            let mut query = Write::<camera::Projection>::query();
+            query.iter_mut(&mut self.world).for_each(|projection| {
+                projection.resize(new_size.width, new_size.height);
+            });
             self.size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
-            self.depth_texture =
-                texture::Texture::create_depth_texture(&self.device, &self.config, "depth_texture");
+            let device = match self.resources.get::<wgpu::Device>() {
+                Some(device) => device,
+                None => {
+                    error!("could not find device in resources");
+                    return;
+                }
+            };
+
+            if let Some(surface) = self.resources.get::<wgpu::Surface>() {
+                surface.configure(&device, &self.config)
+            };
+            
+            if let Some(mut texture) = self.resources.get_mut::<texture::Texture>() {
+                *texture = texture::Texture::create_depth_texture(
+                    &device,
+                    &self.config,
+                    "depth_texture",
+                );
+            }
+            
         }
     }
 
     fn input(&mut self, event: &DeviceEvent) -> bool {
+        let mut camera_controller = self
+            .resources
+            .get_mut::<camera::CameraController>()
+            .unwrap();
+
         match event {
             DeviceEvent::Key(KeyboardInput {
                 virtual_keycode: Some(key),
                 state,
                 ..
-            }) => self.camera_controller.process_keyboard(*key, *state),
+            }) => camera_controller.process_keyboard(*key, *state),
             DeviceEvent::MouseWheel { delta, .. } => {
-                self.camera_controller.process_scroll(delta);
+                camera_controller.process_scroll(delta);
                 true
             }
             DeviceEvent::Button {
@@ -566,116 +587,12 @@ impl State {
             }
             DeviceEvent::MouseMotion { delta } => {
                 if self.mouse_pressed {
-                    self.camera_controller.process_mouse(delta.0, delta.1);
+                    camera_controller.process_mouse(delta.0, delta.1);
                 }
                 true
             }
             _ => false,
         }
-    }
-
-    fn update(&mut self, dt: std::time::Duration) {
-        self.camera_controller.update_camera(&mut self.camera, dt);
-        self.camera_uniform
-            .update_view_proj(&self.camera, &self.projection);
-
-        
-            self.queue.write_buffer(
-            &self.camera_buffer,
-            0,
-            bytemuck::cast_slice(&[self.camera_uniform]),
-        );
-
-        let mut query = Write::<LightInformation>::query();
-
-        query.iter_mut(&mut self.world).for_each(|light_info| {
-            // Update the light
-            let old_position: cgmath::Vector3<_> = light_info.light_uniform.position.into();
-            light_info.light_uniform.position =
-                (cgmath::Quaternion::from_axis_angle((0.0, 1.0, 0.0).into(), cgmath::Deg(1.0))
-                    * old_position)
-                    .into();
-            self.queue.write_buffer(
-                &light_info.light_buffer,
-                0,
-                bytemuck::cast_slice(&[light_info.light_uniform]),
-            );
-        });
-
-        
-    }
-
-    fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
-        let output = self.surface.get_current_texture()?;
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Render Encoder"),
-            });
-
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
-                color_attachments: &[wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
-                            a: 1.0,
-                        }),
-                        store: true,
-                    },
-                }],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_texture.view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: true,
-                    }),
-                    stencil_ops: None,
-                }),
-            });
-
-            let light_info = {
-                let mut query = Read::<LightInformation>::query();
-                query.iter(&self.world).next().unwrap()
-            };
-
-            // let mut query = Write::<LightInformation>::query();
-
-            // let light_info = query.iter_mut(&mut self.world).next().unwrap();
-
-            let mut query = Read::<InstanceInformation>::query();
-            query.iter(&self.world).for_each(|instance_info| {
-                render_pass.set_vertex_buffer(1, instance_info.instance_buffer.slice(..));
-                render_pass.set_pipeline(&light_info.light_render_pipeline);
-                render_pass.draw_light_model(
-                    &self.obj_model,
-                    &self.camera_bind_group,
-                    &light_info.light_bind_group,
-                );
-    
-                render_pass.set_pipeline(&self.render_pipeline);
-                render_pass.draw_model_instanced(
-                    &self.obj_model,
-                    0..instance_info.instances.len() as u32,
-                    &self.camera_bind_group,
-                    &light_info.light_bind_group,
-                );
-            })
-            
-        }
-        self.queue.submit(iter::once(encoder.finish()));
-        output.present();
-
-        Ok(())
     }
 }
 
@@ -690,6 +607,12 @@ async fn main() {
         .unwrap();
     let mut state = State::new(&window).await; // NEW!
     let mut last_render_time = std::time::Instant::now();
+
+    let mut schedule = legion::Schedule::builder()
+        .add_system(update_system())
+        .flush()
+        .add_system(render_system())
+        .build();
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
         match event {
@@ -709,7 +632,7 @@ async fn main() {
                     | WindowEvent::KeyboardInput {
                         input:
                             KeyboardInput {
-                                state: ElementState::Pressed,
+                                state: ElementState::Pressed                                ,
                                 virtual_keycode: Some(VirtualKeyCode::Escape),
                                 ..
                             },
@@ -727,19 +650,134 @@ async fn main() {
             Event::RedrawRequested(_) => {
                 let now = std::time::Instant::now();
                 let dt = now - last_render_time;
+                state.resources.insert(dt);
                 last_render_time = now;
-                state.update(dt);
-                match state.render() {
-                    Ok(_) => {}
-                    // Reconfigure the surface if lost
-                    Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
-                    // The system is out of memory, we should probably quit
-                    Err(wgpu::SurfaceError::OutOfMemory) => *control_flow = ControlFlow::Exit,
-                    // All other errors (Outdated, Timeout) should be resolved by the next frame
-                    Err(e) => eprintln!("{:?}", e),
-                }
+                schedule.execute(&mut state.world, &mut state.resources);
             }
             _ => {}
         }
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+#[system]
+fn update(
+    world: &mut legion::world::SubWorld,
+    query: &mut Query<&mut LightInformation>,
+    #[resource] dt: &std::time::Duration,
+    #[resource] queue: &wgpu::Queue,
+    #[resource] camera: &mut camera::Camera,
+    #[resource] camera_controller: &mut camera::CameraController,
+    #[resource] (camera_uniform, camera_buffer, _): &mut CameraRenderInformation,
+    #[resource] projection: &camera::Projection,
+) {
+    camera_controller.update_camera(camera, *dt);
+    camera_uniform.update_view_proj(camera, projection);
+
+    queue.write_buffer(
+        &camera_buffer.0,
+        0,
+        bytemuck::cast_slice(&[*camera_uniform]),
+    );
+
+    query.iter_mut(world).for_each(|light_info| {
+        //Update the light
+        let old_position: cgmath::Vector3<_> = light_info.light_uniform.position.into();
+        light_info.light_uniform.position =
+            (cgmath::Quaternion::from_axis_angle((0.0, 1.0, 0.0).into(), cgmath::Deg(1.0))
+                * old_position)
+                .into();
+        queue.write_buffer(
+            &light_info.light_buffer,
+            0,
+            bytemuck::cast_slice(&[light_info.light_uniform]),
+        );
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+#[system]
+fn render(
+    world: &mut legion::world::SubWorld,
+    light_query: &mut Query<&LightInformation>,
+    instance_query: &mut Query<(&InstanceInformation, &legion::Entity)>,
+    model_query: &mut Query<&model::Model>,
+    #[resource] surface: &wgpu::Surface,
+    #[resource] device: &wgpu::Device,
+    #[resource] depth_texture: &texture::Texture,
+    #[resource] (_, _, camera_bind_group): &CameraRenderInformation,
+    #[resource] render_pipeline: &wgpu::RenderPipeline,
+    #[resource] queue: &wgpu::Queue,
+) {
+    let result: anyhow::Result<()> = (|| {
+        let output = surface.get_current_texture()?;
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Render Encoder"),
+        });
+
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Render Pass"),
+                color_attachments: &[wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.2,
+                            b: 0.3,
+                            a: 1.0,
+                        }),
+                        store: true,
+                    },
+                }],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &depth_texture.view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: true,
+                    }),
+                    stencil_ops: None,
+                }),
+            });
+            let light_info = light_query
+                .iter(world)
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("No light information"))?;
+
+            for (instance_info, obj_model_entity) in instance_query.iter(world) {
+                let obj_model = {
+                    model_query
+                        .get(world, *obj_model_entity)
+                        .with_context(|| anyhow::anyhow!("No model information"))?
+                };
+                render_pass.set_vertex_buffer(1, instance_info.instance_buffer.slice(..));
+                render_pass.set_pipeline(&light_info.light_render_pipeline);
+                render_pass.draw_light_model(
+                    obj_model,
+                    &camera_bind_group.0,
+                    &light_info.light_bind_group,
+                );
+
+                render_pass.set_pipeline(render_pipeline);
+                render_pass.draw_model_instanced(
+                    obj_model,
+                    0..instance_info.instances.len() as u32,
+                    &camera_bind_group.0,
+                    &light_info.light_bind_group,
+                );
+            }
+        }
+        queue.submit(std::iter::once(encoder.finish()));
+        output.present();
+
+        Ok(())
+    })();
+    if let Err(e) = result {
+        error!("{}", e);
+    }
 }

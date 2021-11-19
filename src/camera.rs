@@ -49,8 +49,7 @@ impl Camera {
 
         let xxx: Matrix4<f32> = xx.into();
 
-        return xxx;
-
+        xxx
     }
 }
 
@@ -76,10 +75,10 @@ impl Projection {
     }
 
     pub fn calc_matrix(&self) -> Matrix4<f32> {
-        let x = OPENGL_TO_WGPU_MATRIX * Matrix4::new_perspective(self.aspect, self.fovy, self.znear, self.zfar);
-    
+        OPENGL_TO_WGPU_MATRIX
+            * Matrix4::new_perspective(self.aspect, self.fovy, self.znear, self.zfar)
 
-        return x;
+        
     }
 }
 
@@ -169,12 +168,10 @@ impl CameraController {
         // Move forward/backward and left/right
         let (yaw_sin, yaw_cos) = camera.yaw.0.sin_cos();
 
-
         let forward = Vector3::new(yaw_cos, 0.0, yaw_sin).normalize();
         let right = Vector3::new(-yaw_sin, 0.0, yaw_cos).normalize();
         camera.position += forward * (self.amount_forward - self.amount_backward) * self.speed * dt;
         camera.position += right * (self.amount_right - self.amount_left) * self.speed * dt;
-
 
         // Move in/out (aka. "zoom")
         // Note: this isn't an actual zoom. The camera's position
@@ -193,7 +190,6 @@ impl CameraController {
         // Rotate
         camera.yaw += Rad(self.rotate_horizontal) * self.sensitivity * dt;
         camera.pitch += Rad(-self.rotate_vertical) * self.sensitivity * dt;
-
 
         // If process_mouse isn't called every frame, these values
         // will not get set to zero, and the camera will rotate
