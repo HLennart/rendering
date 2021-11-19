@@ -1,108 +1,42 @@
+use std::fmt::Debug;
+
 use anyhow::Context;
+use camera::CameraUniform;
 use cgmath::prelude::*;
 use egui::FontDefinitions;
 use egui_winit_platform::PlatformDescriptor;
 use epi::App;
-use legion::{system, IntoQuery, Query, Write};
+use instance::Instance;
+use legion::{system, Query};
+use light::LightUniform;
 use log::error;
-use rayon::prelude::*;
-use wgpu::util::DeviceExt;
+
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
-    window::Window,
 };
 // use winit::event::Event::*;
 use winit::event::Event::WindowEvent;
+mod ui;
 mod camera;
 mod model;
 mod texture;
+mod state;
+mod instance;
+mod light;
 
-use model::{DrawLight, DrawModel, Vertex};
+use model::{DrawLight, DrawModel};
 
-const NUM_INSTANCES_PER_ROW: u32 = 10;
+use crate::state::State;
 
-#[derive(Default)]
-struct EguiApp {}
 
-trait WarnLabel {
-    fn warn_label(&mut self, label: impl ToString) -> egui::Response;
-}
 
-impl WarnLabel for egui::Ui {
-    #[inline(always)]
-    fn warn_label(&mut self, text: impl ToString) -> egui::Response {
-        use egui::Widget;
 
-        egui::Label::new(text)
-            .text_color(egui::Color32::RED)
-            .text_style(egui::TextStyle::Monospace)
-            .ui(self)
-    }
-}
 
-// #[inline(always)]
-// pub fn red_label(&mut self, text: impl ToString) -> Response {
-//     Label::new(text).ui(self)
-// }
 
-impl EguiApp {
-    fn bar_contents(&mut self, ui: &mut egui::Ui, frame: &mut epi::Frame<'_>) {
-        ui.horizontal_wrapped(|ui| {
-            ui.with_layout(egui::Layout::left_to_right(), |ui| {
-                ui.warn_label("frame time: ");
-                ui.warn_label(format!("{:.8}", frame.info().cpu_usage.unwrap() * 1000.0));
-                ui.warn_label("ms");
-            });
-        });
-    }
-}
 
-impl epi::App for EguiApp {
-    fn update(&mut self, ctx: &egui::CtxRef, frame: &mut epi::Frame<'_>) {
-        egui::TopBottomPanel::top("egui_app_top_bar")
-            .frame(egui::Frame {
-                fill: egui::Color32::TRANSPARENT,
-                ..Default::default()
-            })
-            .show(ctx, |ui| {
-                egui::trace!(ui);
-                self.bar_contents(ui, frame);
-            });
-    }
 
-    fn setup(
-        &mut self,
-        _ctx: &egui::CtxRef,
-        _frame: &mut epi::Frame<'_>,
-        _storage: Option<&dyn epi::Storage>,
-    ) {
-        
-    }
 
-    fn clear_color(&self) -> egui::Rgba {
-        egui::Rgba::TRANSPARENT
-    }
-
-    fn name(&self) -> &str {
-        "test egui"
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct CameraUniform {
-    view_position: [f32; 4],
-    view_proj: [[f32; 4]; 4],
-}
-
-#[derive(Debug)]
-struct LightInformation {
-    light_uniform: LightUniform,
-    light_buffer: wgpu::Buffer,
-    light_bind_group: wgpu::BindGroup,
-    light_render_pipeline: wgpu::RenderPipeline,
-}
 
 #[derive(Debug)]
 struct InstanceInformation {
@@ -112,564 +46,27 @@ struct InstanceInformation {
 
 type CameraRenderInformation = (CameraUniform, CameraBuffer, CameraBindGroup);
 
-impl CameraUniform {
-    fn new() -> Self {
-        Self {
-            view_position: [0.0; 4],
-            view_proj: cgmath::Matrix4::identity().into(),
-        }
-    }
 
-    fn update_view_proj(&mut self, camera: &camera::Camera, projection: &camera::Projection) {
-        self.view_position = camera.position.to_homogeneous().into();
 
-        self.view_proj = (projection.calc_matrix() * camera.calc_matrix()).into()
-    }
-}
 
 #[derive(Debug)]
-struct Instance {
-    position: cgmath::Vector3<f32>,
-    rotation: cgmath::Quaternion<f32>,
-}
-
-impl Instance {
-    fn to_raw(&self) -> InstanceRaw {
-        InstanceRaw {
-            model: (cgmath::Matrix4::from_translation(self.position)
-                * cgmath::Matrix4::from(self.rotation))
-            .into(),
-            normal: cgmath::Matrix3::from(self.rotation).into(),
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-#[allow(dead_code)]
-struct InstanceRaw {
-    model: [[f32; 4]; 4],
-    normal: [[f32; 3]; 3],
-}
-
-impl model::Vertex for InstanceRaw {
-    fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
-        use std::mem;
-        wgpu::VertexBufferLayout {
-            array_stride: mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
-            step_mode: wgpu::VertexStepMode::Instance,
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 5,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                // A mat4 takes up 4 vertex slots as it is technically 4 vec4s. We need to define a slot
-                // for each vec4. We don't have to do this in code though.
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 4]>() as wgpu::BufferAddress,
-                    shader_location: 6,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 8]>() as wgpu::BufferAddress,
-                    shader_location: 7,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 12]>() as wgpu::BufferAddress,
-                    shader_location: 8,
-                    format: wgpu::VertexFormat::Float32x4,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 16]>() as wgpu::BufferAddress,
-                    shader_location: 9,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 19]>() as wgpu::BufferAddress,
-                    shader_location: 10,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 22]>() as wgpu::BufferAddress,
-                    shader_location: 11,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-            ],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct LightUniform {
-    position: [f32; 3],
-    // Due to uniforms requiring 16 byte (4 float) spacing, we need to use a padding field here
-    _padding: u32,
-    color: [f32; 3],
+pub struct LightInformation {
+    light_uniform: LightUniform,
+    light_buffer: wgpu::Buffer,
+    light_bind_group: wgpu::BindGroup,
+    light_render_pipeline: wgpu::RenderPipeline,
 }
 
 struct CameraBuffer(wgpu::Buffer);
 struct CameraBindGroup(wgpu::BindGroup);
 
-struct State {
-    config: wgpu::SurfaceConfiguration,
-    size: winit::dpi::PhysicalSize<u32>,
-    #[allow(dead_code)]
-    debug_material: model::Material,
-    mouse_pressed: bool,
-    world: legion::World,
-    resources: legion::Resources,
-}
 
-fn create_render_pipeline(
-    device: &wgpu::Device,
-    layout: &wgpu::PipelineLayout,
-    color_format: wgpu::TextureFormat,
-    depth_format: Option<wgpu::TextureFormat>,
-    vertex_layouts: &[wgpu::VertexBufferLayout],
-    shader: wgpu::ShaderModuleDescriptor,
-) -> wgpu::RenderPipeline {
-    let shader = device.create_shader_module(&shader);
 
-    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(&format!("{:?}", shader)),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: "vs_main",
-            buffers: vertex_layouts,
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: "fs_main",
-            targets: &[wgpu::ColorTargetState {
-                format: color_format,
-                blend: Some(wgpu::BlendState {
-                    alpha: wgpu::BlendComponent::REPLACE,
-                    color: wgpu::BlendComponent::REPLACE,
-                }),
-                write_mask: wgpu::ColorWrites::ALL,
-            }],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            strip_index_format: None,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode: Some(wgpu::Face::Back),
-            // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
-            polygon_mode: wgpu::PolygonMode::Fill,
-            // Requires Features::DEPTH_CLAMPING
-            clamp_depth: false,
-            // Requires Features::CONSERVATIVE_RASTERIZATION
-            conservative: false,
-        },
-        depth_stencil: depth_format.map(|format| wgpu::DepthStencilState {
-            format,
-            depth_write_enabled: true,
-            depth_compare: wgpu::CompareFunction::Less,
-            stencil: wgpu::StencilState::default(),
-            bias: wgpu::DepthBiasState::default(),
-        }),
-        multisample: wgpu::MultisampleState {
-            count: 1,
-            mask: !0,
-            alpha_to_coverage_enabled: false,
-        },
-    })
-}
+
 
 struct ScaleFactor(f64);
 
-impl State {
-    async fn new(window: &Window) -> Self {
-        let size = window.inner_size();
 
-        // The instance is a handle to our GPU
-        // BackendBit::PRIMARY => Vulkan + Metal + DX12 + Browser WebGPU
-        let instance = wgpu::Instance::new(wgpu::Backends::all());
-        let surface = unsafe { instance.create_surface(window) };
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .unwrap();
-        let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: None,
-                    features: wgpu::Features::empty(),
-                    limits: wgpu::Limits::default(),
-                },
-                None, // Trace path
-            )
-            .await
-            .unwrap();
-
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface.get_preferred_format(&adapter).unwrap(),
-            width: size.width,
-            height: size.height,
-            present_mode: wgpu::PresentMode::Fifo,
-        };
-
-        surface.configure(&device, &config);
-
-        let texture_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler {
-                            comparison: false,
-                            filtering: true,
-                        },
-                        count: None,
-                    },
-                    // normal map
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            multisampled: false,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler {
-                            comparison: false,
-                            filtering: true,
-                        },
-                        count: None,
-                    },
-                ],
-                label: Some("texture_bind_group_layout"),
-            });
-
-        let camera = camera::Camera::new([0.0, 5.0, 10.0], cgmath::Deg(-90.0), cgmath::Deg(-20.0));
-        let projection = camera::Projection::new(config.width, config.height, 45.0, 0.1, 100.0);
-        let camera_controller = camera::CameraController::new(4.0, 0.4);
-
-        let mut camera_uniform = CameraUniform::new();
-        camera_uniform.update_view_proj(&camera, &projection);
-
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Camera Buffer"),
-            contents: bytemuck::cast_slice(&[camera_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        const SPACE_BETWEEN: f32 = 3.0;
-        let instances = (0..NUM_INSTANCES_PER_ROW)
-            .into_par_iter() // NEW!
-            .flat_map(|z| {
-                (0..NUM_INSTANCES_PER_ROW).into_par_iter().map(move |x| {
-                    let x = SPACE_BETWEEN * (x as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
-                    let z = SPACE_BETWEEN * (z as f32 - NUM_INSTANCES_PER_ROW as f32 / 2.0);
-
-                    let position = cgmath::Vector3 { x, y: 0.0, z };
-
-                    let rotation = if position.is_zero() {
-                        cgmath::Quaternion::from_axis_angle(
-                            cgmath::Vector3::unit_z(),
-                            cgmath::Deg(0.0),
-                        )
-                    } else {
-                        cgmath::Quaternion::from_axis_angle(position.normalize(), cgmath::Deg(45.0))
-                    };
-
-                    Instance { position, rotation }
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let instance_data = instances.iter().map(Instance::to_raw).collect::<Vec<_>>();
-        let instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Instance Buffer"),
-            contents: bytemuck::cast_slice(&instance_data),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let camera_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-                label: Some("camera_bind_group_layout"),
-            });
-
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
-            label: Some("camera_bind_group"),
-        });
-
-        let res_dir = std::path::Path::new(env!("OUT_DIR")).join("res");
-        let obj_model = model::Model::load(
-            &device,
-            &queue,
-            &texture_bind_group_layout,
-            res_dir.join("cube.obj"),
-        )
-        .unwrap();
-
-        let light_uniform = LightUniform {
-            position: [2.0, 2.0, 2.0],
-            _padding: 0,
-            color: [1.0, 1.0, 1.0],
-        };
-
-        let light_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Light VB"),
-            contents: bytemuck::cast_slice(&[light_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let light_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-                label: None,
-            });
-
-        let light_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &light_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: light_buffer.as_entire_binding(),
-            }],
-            label: None,
-        });
-
-        let depth_texture =
-            texture::Texture::create_depth_texture(&device, &config, "depth_texture");
-
-        let render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Render Pipeline Layout"),
-                bind_group_layouts: &[
-                    &texture_bind_group_layout,
-                    &camera_bind_group_layout,
-                    &light_bind_group_layout,
-                ],
-                push_constant_ranges: &[],
-            });
-
-        let render_pipeline = {
-            let shader = wgpu::ShaderModuleDescriptor {
-                label: Some("Normal Shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
-            };
-            create_render_pipeline(
-                &device,
-                &render_pipeline_layout,
-                config.format,
-                Some(texture::Texture::DEPTH_FORMAT),
-                &[model::ModelVertex::desc(), InstanceRaw::desc()],
-                shader,
-            )
-        };
-
-        let light_render_pipeline = {
-            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Light Pipeline Layout"),
-                bind_group_layouts: &[&camera_bind_group_layout, &light_bind_group_layout],
-                push_constant_ranges: &[],
-            });
-            let shader = wgpu::ShaderModuleDescriptor {
-                label: Some("Light Shader"),
-                source: wgpu::ShaderSource::Wgsl(include_str!("light.wgsl").into()),
-            };
-            create_render_pipeline(
-                &device,
-                &layout,
-                config.format,
-                Some(texture::Texture::DEPTH_FORMAT),
-                &[model::ModelVertex::desc()],
-                shader,
-            )
-        };
-
-        let debug_material = {
-            let diffuse_bytes = include_bytes!("../res/cobble-diffuse.png");
-            let normal_bytes = include_bytes!("../res/cobble-normal.png");
-
-            let diffuse_texture = texture::Texture::from_bytes(
-                &device,
-                &queue,
-                diffuse_bytes,
-                "res/alt-diffuse.png",
-                false,
-            )
-            .unwrap();
-            let normal_texture = texture::Texture::from_bytes(
-                &device,
-                &queue,
-                normal_bytes,
-                "res/alt-normal.png",
-                true,
-            )
-            .unwrap();
-
-            model::Material::new(
-                &device,
-                "alt-material",
-                diffuse_texture,
-                normal_texture,
-                &texture_bind_group_layout,
-            )
-        };
-
-        let mut world = legion::World::default();
-        let mut resources = legion::Resources::default();
-
-        resources.insert(camera);
-        resources.insert(camera_controller);
-        resources.insert(projection);
-        resources.insert((
-            camera_uniform,
-            CameraBuffer(camera_buffer),
-            CameraBindGroup(camera_bind_group),
-        ));
-        resources.insert(queue);
-        resources.insert(surface);
-        resources.insert(device);
-        resources.insert(adapter);
-        resources.insert(depth_texture);
-        resources.insert(render_pipeline);
-        resources.insert(ScaleFactor(window.scale_factor()));
-
-        let obj_model_id = world.push((obj_model,));
-
-        world.push((LightInformation {
-            light_uniform,
-            light_buffer,
-            light_bind_group,
-            light_render_pipeline,
-        },));
-
-        world.push((
-            InstanceInformation {
-                instances,
-                instance_buffer,
-            },
-            obj_model_id,
-        ));
-
-        Self {
-            config,
-            size,
-            #[allow(dead_code)]
-            debug_material,
-            mouse_pressed: false,
-            world,
-            resources,
-        }
-    }
-
-    fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
-            let mut query = Write::<camera::Projection>::query();
-            query.iter_mut(&mut self.world).for_each(|projection| {
-                projection.resize(new_size.width, new_size.height);
-            });
-            self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
-            let device = match self.resources.get::<wgpu::Device>() {
-                Some(device) => device,
-                None => {
-                    error!("could not find device in resources");
-                    return;
-                }
-            };
-
-            if let Some(surface) = self.resources.get::<wgpu::Surface>() {
-                surface.configure(&device, &self.config)
-            };
-
-            if let Some(mut texture) = self.resources.get_mut::<texture::Texture>() {
-                *texture =
-                    texture::Texture::create_depth_texture(&device, &self.config, "depth_texture");
-            }
-
-            if let Some(mut res) = self.resources.get_mut::<EguiResources>() {
-                res.size = new_size;
-            }
-        }
-    }
-
-    fn input(&mut self, event: &DeviceEvent) -> bool {
-        let mut camera_controller = self
-            .resources
-            .get_mut::<camera::CameraController>()
-            .unwrap();
-
-        match event {
-            DeviceEvent::Key(KeyboardInput {
-                virtual_keycode: Some(key),
-                state,
-                ..
-            }) => camera_controller.process_keyboard(*key, *state),
-            DeviceEvent::MouseWheel { delta, .. } => {
-                camera_controller.process_scroll(delta);
-                true
-            }
-            DeviceEvent::Button {
-                button: 1, // Left Mouse Button
-                state,
-            } => {
-                self.mouse_pressed = *state == ElementState::Pressed;
-                true
-            }
-            DeviceEvent::MouseMotion { delta } => {
-                if self.mouse_pressed {
-                    camera_controller.process_mouse(delta.0, delta.1);
-                }
-                true
-            }
-            _ => false,
-        }
-    }
-}
 
 struct DeltaTime(std::time::Duration);
 struct InstantApplicationStart(std::time::Instant);
@@ -711,7 +108,7 @@ async fn main() {
         event_loop.create_proxy(),
     )));
 
-    let app = EguiApp::default();
+    let app = ui::UiApp::default();
 
     state.resources.insert(EguiResources {
         egui_rpass,
@@ -793,6 +190,7 @@ fn update(
     #[resource] camera_controller: &mut camera::CameraController,
     #[resource] (camera_uniform, camera_buffer, _): &mut CameraRenderInformation,
     #[resource] projection: &camera::Projection,
+    #[resource] EguiResources { app, .. }: &mut EguiResources,
 ) {
     camera_controller.update_camera(camera, *dt);
     camera_uniform.update_view_proj(camera, projection);
@@ -802,6 +200,8 @@ fn update(
         0,
         bytemuck::cast_slice(&[*camera_uniform]),
     );
+
+    app.player_pos = camera.position;
 
     query.iter_mut(world).for_each(|light_info| {
         //Update the light
@@ -836,7 +236,7 @@ struct EguiResources {
     start_time: InstantApplicationStart,
     repaint_signal: std::sync::Arc<RenderRepaintSignal>,
     size: winit::dpi::PhysicalSize<u32>,
-    app: EguiApp,
+    app: ui::UiApp,
 }
 
 #[allow(clippy::too_many_arguments)]
