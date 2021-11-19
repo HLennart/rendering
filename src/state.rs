@@ -1,10 +1,20 @@
-use crate::{CameraBindGroup, CameraBuffer, EguiResources, InstanceInformation, LightInformation, ScaleFactor, camera::CameraUniform, instance::{Instance, InstanceRaw, NUM_INSTANCES_PER_ROW}, light::LightUniform, model::{self, Vertex}, texture};
+use crate::camera;
+use crate::{
+    camera::CameraUniform,
+    instance::{Instance, InstanceRaw, NUM_INSTANCES_PER_ROW},
+    light::LightUniform,
+    model::{self, Vertex},
+    texture, CameraBindGroup, CameraBuffer, EguiResources, InstanceInformation, LightInformation,
+    ScaleFactor,
+};
 use cgmath::{InnerSpace, Quaternion, Rotation3, Zero};
 use log::error;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use wgpu::util::DeviceExt;
-use winit::{event::{DeviceEvent, ElementState, KeyboardInput}, window::Window};
-use crate::camera;
+use winit::{
+    event::{DeviceEvent, ElementState, KeyboardInput},
+    window::Window,
+};
 
 pub struct State {
     pub config: wgpu::SurfaceConfiguration,
@@ -341,7 +351,10 @@ impl State {
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
-            self.resources.get_mut::<camera::Projection>().unwrap().resize(new_size.width, new_size.height);
+            self.resources
+                .get_mut::<camera::Projection>()
+                .unwrap()
+                .resize(new_size.width, new_size.height);
 
             self.size = new_size;
             self.config.width = new_size.width;
@@ -402,7 +415,6 @@ impl State {
         }
     }
 }
-
 
 fn create_render_pipeline(
     device: &wgpu::Device,

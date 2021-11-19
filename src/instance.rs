@@ -2,7 +2,6 @@ use crate::model;
 
 pub const NUM_INSTANCES_PER_ROW: u32 = 10;
 
-
 #[derive(Debug, Clone)]
 pub struct Instance {
     pub position: cgmath::Vector3<f32>,

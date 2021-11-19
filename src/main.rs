@@ -1,3 +1,11 @@
+mod camera;
+mod instance;
+mod light;
+mod model;
+mod state;
+mod texture;
+mod ui;
+
 use std::fmt::Debug;
 
 use anyhow::Context;
@@ -11,32 +19,15 @@ use legion::{system, Query};
 use light::LightUniform;
 use log::error;
 
+use winit::event::Event::WindowEvent;
 use winit::{
     event::*,
     event_loop::{ControlFlow, EventLoop},
 };
-// use winit::event::Event::*;
-use winit::event::Event::WindowEvent;
-mod ui;
-mod camera;
-mod model;
-mod texture;
-mod state;
-mod instance;
-mod light;
 
 use model::{DrawLight, DrawModel};
 
 use crate::state::State;
-
-
-
-
-
-
-
-
-
 
 #[derive(Debug)]
 struct InstanceInformation {
@@ -46,9 +37,6 @@ struct InstanceInformation {
 
 type CameraRenderInformation = (CameraUniform, CameraBuffer, CameraBindGroup);
 
-
-
-
 #[derive(Debug)]
 pub struct LightInformation {
     light_uniform: LightUniform,
@@ -57,18 +45,15 @@ pub struct LightInformation {
     light_render_pipeline: wgpu::RenderPipeline,
 }
 
+#[derive(Debug)]
 struct CameraBuffer(wgpu::Buffer);
+#[derive(Debug)]
 struct CameraBindGroup(wgpu::BindGroup);
-
-
-
-
-
+#[derive(Debug)]
 struct ScaleFactor(f64);
-
-
-
+#[derive(Debug)]
 struct DeltaTime(std::time::Duration);
+#[derive(Debug)]
 struct InstantApplicationStart(std::time::Instant);
 
 #[tokio::main]
@@ -171,9 +156,6 @@ async fn main() {
                     _ => {}
                 }
             }
-            // Event::RedrawRequested(_) => {
-                
-            // }
             _ => {}
         }
     });

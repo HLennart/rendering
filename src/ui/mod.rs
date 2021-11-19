@@ -1,16 +1,14 @@
 mod warn_label;
 use warn_label::WarnLabel;
 
-
-
 pub struct UiApp {
-    pub player_pos: nalgebra::Point3<f32>
+    pub player_pos: nalgebra::Point3<f32>,
 }
 
 impl Default for UiApp {
     fn default() -> Self {
         Self {
-            player_pos: [0.0f32; 3].into()
+            player_pos: [0.0f32; 3].into(),
         }
     }
 }
@@ -63,7 +61,6 @@ impl epi::App for UiApp {
         _frame: &mut epi::Frame<'_>,
         _storage: Option<&dyn epi::Storage>,
     ) {
-        
     }
 
     fn clear_color(&self) -> egui::Rgba {
