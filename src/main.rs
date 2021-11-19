@@ -1,5 +1,5 @@
 use cgmath::prelude::*;
-use legion::{IntoQuery, Write};
+use legion::{IntoQuery, Read, Write};
 use rayon::prelude::*;
 use std::iter;
 use wgpu::util::DeviceExt;
@@ -32,6 +32,12 @@ struct LightInformation {
     light_render_pipeline: wgpu::RenderPipeline,
 }
 
+#[derive(Debug)]
+struct InstanceInformation {
+    instances: Vec<Instance>,
+    instance_buffer: wgpu::Buffer,
+}
+
 impl CameraUniform {
     fn new() -> Self {
         Self {
@@ -49,6 +55,7 @@ impl CameraUniform {
     }
 }
 
+#[derive(Debug)]
 struct Instance {
     position: cgmath::Vector3<f32>,
     rotation: cgmath::Quaternion<f32>,
@@ -144,9 +151,6 @@ struct State {
     camera_uniform: CameraUniform,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    instances: Vec<Instance>,
-    #[allow(dead_code)]
-    instance_buffer: wgpu::Buffer,
     depth_texture: texture::Texture,
     size: winit::dpi::PhysicalSize<u32>,
     #[allow(dead_code)]
@@ -501,6 +505,13 @@ impl State {
             },
         ));
 
+        world.push((
+            InstanceInformation {
+                instances,
+                instance_buffer
+            },
+        ));
+
         Self {
             surface,
             device,
@@ -514,8 +525,6 @@ impl State {
             camera_buffer,
             camera_bind_group,
             camera_uniform,
-            instances,
-            instance_buffer,
             depth_texture,
             size,
             #[allow(dead_code)]
@@ -634,10 +643,18 @@ impl State {
                 }),
             });
 
-            let mut query = Write::<LightInformation>::query();
+            let light_info = {
+                let mut query = Read::<LightInformation>::query();
+                query.iter(&self.world).next().unwrap()
+            };
 
-            query.iter_mut(&mut self.world).for_each(|light_info| {
-                render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+            // let mut query = Write::<LightInformation>::query();
+
+            // let light_info = query.iter_mut(&mut self.world).next().unwrap();
+
+            let mut query = Read::<InstanceInformation>::query();
+            query.iter(&self.world).for_each(|instance_info| {
+                render_pass.set_vertex_buffer(1, instance_info.instance_buffer.slice(..));
                 render_pass.set_pipeline(&light_info.light_render_pipeline);
                 render_pass.draw_light_model(
                     &self.obj_model,
@@ -648,12 +665,11 @@ impl State {
                 render_pass.set_pipeline(&self.render_pipeline);
                 render_pass.draw_model_instanced(
                     &self.obj_model,
-                    0..self.instances.len() as u32,
+                    0..instance_info.instances.len() as u32,
                     &self.camera_bind_group,
                     &light_info.light_bind_group,
                 );
-            });
-
+            })
             
         }
         self.queue.submit(iter::once(encoder.finish()));
