@@ -175,7 +175,6 @@ impl CameraController {
         camera.position += forward * (self.amount_forward - self.amount_backward) * self.speed * dt;
         camera.position += right * (self.amount_right - self.amount_left) * self.speed * dt;
 
-        // println!("camera.position: {:#?}", &camera.position);
 
         // Move in/out (aka. "zoom")
         // Note: this isn't an actual zoom. The camera's position
@@ -195,8 +194,6 @@ impl CameraController {
         camera.yaw += Rad(self.rotate_horizontal) * self.sensitivity * dt;
         camera.pitch += Rad(-self.rotate_vertical) * self.sensitivity * dt;
 
-        println!("camera.yaw: {:#?}", &camera.yaw);
-        println!("camera.pitch: {:#?}", &camera.pitch);
 
         // If process_mouse isn't called every frame, these values
         // will not get set to zero, and the camera will rotate

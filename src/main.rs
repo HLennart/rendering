@@ -1,4 +1,5 @@
 use cgmath::prelude::*;
+use legion::{IntoQuery, Write};
 use rayon::prelude::*;
 use std::iter;
 use wgpu::util::DeviceExt;
@@ -21,6 +22,14 @@ const NUM_INSTANCES_PER_ROW: u32 = 10;
 struct CameraUniform {
     view_position: [f32; 4],
     view_proj: [[f32; 4]; 4],
+}
+
+#[derive(Debug)]
+struct LightInformation {
+    light_uniform: LightUniform,
+    light_buffer: wgpu::Buffer,
+    light_bind_group: wgpu::BindGroup,
+    light_render_pipeline: wgpu::RenderPipeline,
 }
 
 impl CameraUniform {
@@ -140,13 +149,10 @@ struct State {
     instance_buffer: wgpu::Buffer,
     depth_texture: texture::Texture,
     size: winit::dpi::PhysicalSize<u32>,
-    light_uniform: LightUniform,
-    light_buffer: wgpu::Buffer,
-    light_bind_group: wgpu::BindGroup,
-    light_render_pipeline: wgpu::RenderPipeline,
     #[allow(dead_code)]
     debug_material: model::Material,
     mouse_pressed: bool,
+    world: legion::World,
 }
 
 fn create_render_pipeline(
@@ -484,6 +490,17 @@ impl State {
             )
         };
 
+        let mut world = legion::World::default();
+
+        world.push((
+            LightInformation {
+                light_uniform,
+                light_buffer,
+                light_bind_group,
+                light_render_pipeline
+            },
+        ));
+
         Self {
             surface,
             device,
@@ -501,13 +518,10 @@ impl State {
             instance_buffer,
             depth_texture,
             size,
-            light_uniform,
-            light_buffer,
-            light_bind_group,
-            light_render_pipeline,
             #[allow(dead_code)]
             debug_material,
             mouse_pressed: false,
+            world
         }
     }
 
@@ -563,17 +577,23 @@ impl State {
             bytemuck::cast_slice(&[self.camera_uniform]),
         );
 
-        // Update the light
-        let old_position: cgmath::Vector3<_> = self.light_uniform.position.into();
-        self.light_uniform.position =
-            (cgmath::Quaternion::from_axis_angle((0.0, 1.0, 0.0).into(), cgmath::Deg(1.0))
-                * old_position)
-                .into();
-        self.queue.write_buffer(
-            &self.light_buffer,
-            0,
-            bytemuck::cast_slice(&[self.light_uniform]),
-        );
+        let mut query = Write::<LightInformation>::query();
+
+        query.iter_mut(&mut self.world).for_each(|light_info| {
+            // Update the light
+            let old_position: cgmath::Vector3<_> = light_info.light_uniform.position.into();
+            light_info.light_uniform.position =
+                (cgmath::Quaternion::from_axis_angle((0.0, 1.0, 0.0).into(), cgmath::Deg(1.0))
+                    * old_position)
+                    .into();
+            self.queue.write_buffer(
+                &light_info.light_buffer,
+                0,
+                bytemuck::cast_slice(&[light_info.light_uniform]),
+            );
+        });
+
+        
     }
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
@@ -614,21 +634,27 @@ impl State {
                 }),
             });
 
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
-            render_pass.set_pipeline(&self.light_render_pipeline);
-            render_pass.draw_light_model(
-                &self.obj_model,
-                &self.camera_bind_group,
-                &self.light_bind_group,
-            );
+            let mut query = Write::<LightInformation>::query();
 
-            render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.draw_model_instanced(
-                &self.obj_model,
-                0..self.instances.len() as u32,
-                &self.camera_bind_group,
-                &self.light_bind_group,
-            );
+            query.iter_mut(&mut self.world).for_each(|light_info| {
+                render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..));
+                render_pass.set_pipeline(&light_info.light_render_pipeline);
+                render_pass.draw_light_model(
+                    &self.obj_model,
+                    &self.camera_bind_group,
+                    &light_info.light_bind_group,
+                );
+    
+                render_pass.set_pipeline(&self.render_pipeline);
+                render_pass.draw_model_instanced(
+                    &self.obj_model,
+                    0..self.instances.len() as u32,
+                    &self.camera_bind_group,
+                    &light_info.light_bind_group,
+                );
+            });
+
+            
         }
         self.queue.submit(iter::once(encoder.finish()));
         output.present();
