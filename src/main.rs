@@ -1,5 +1,8 @@
 use anyhow::Context;
 use cgmath::prelude::*;
+use egui::FontDefinitions;
+use egui_winit_platform::PlatformDescriptor;
+use epi::App;
 use legion::{system, IntoQuery, Query, Write};
 use log::error;
 use rayon::prelude::*;
@@ -9,7 +12,8 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::Window,
 };
-
+// use winit::event::Event::*;
+use winit::event::Event::WindowEvent;
 mod camera;
 mod model;
 mod texture;
@@ -17,6 +21,73 @@ mod texture;
 use model::{DrawLight, DrawModel, Vertex};
 
 const NUM_INSTANCES_PER_ROW: u32 = 10;
+
+#[derive(Default)]
+struct EguiApp {}
+
+trait WarnLabel {
+    fn warn_label(&mut self, label: impl ToString) -> egui::Response;
+}
+
+impl WarnLabel for egui::Ui {
+    #[inline(always)]
+    fn warn_label(&mut self, text: impl ToString) -> egui::Response {
+        use egui::Widget;
+
+        egui::Label::new(text)
+            .text_color(egui::Color32::RED)
+            .text_style(egui::TextStyle::Monospace)
+            .ui(self)
+    }
+}
+
+// #[inline(always)]
+// pub fn red_label(&mut self, text: impl ToString) -> Response {
+//     Label::new(text).ui(self)
+// }
+
+impl EguiApp {
+    fn bar_contents(&mut self, ui: &mut egui::Ui, frame: &mut epi::Frame<'_>) {
+        ui.horizontal_wrapped(|ui| {
+            ui.with_layout(egui::Layout::left_to_right(), |ui| {
+                ui.warn_label("frame time: ");
+                ui.warn_label(format!("{:.8}", frame.info().cpu_usage.unwrap() * 1000.0));
+                ui.warn_label("ms");
+            });
+        });
+    }
+}
+
+impl epi::App for EguiApp {
+    fn update(&mut self, ctx: &egui::CtxRef, frame: &mut epi::Frame<'_>) {
+        egui::TopBottomPanel::top("egui_app_top_bar")
+            .frame(egui::Frame {
+                fill: egui::Color32::TRANSPARENT,
+                ..Default::default()
+            })
+            .show(ctx, |ui| {
+                egui::trace!(ui);
+                self.bar_contents(ui, frame);
+            });
+    }
+
+    fn setup(
+        &mut self,
+        _ctx: &egui::CtxRef,
+        _frame: &mut epi::Frame<'_>,
+        _storage: Option<&dyn epi::Storage>,
+    ) {
+        
+    }
+
+    fn clear_color(&self) -> egui::Rgba {
+        egui::Rgba::TRANSPARENT
+    }
+
+    fn name(&self) -> &str {
+        "test egui"
+    }
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -208,6 +279,8 @@ fn create_render_pipeline(
         },
     })
 }
+
+struct ScaleFactor(f64);
 
 impl State {
     async fn new(window: &Window) -> Self {
@@ -499,8 +572,10 @@ impl State {
         resources.insert(queue);
         resources.insert(surface);
         resources.insert(device);
+        resources.insert(adapter);
         resources.insert(depth_texture);
         resources.insert(render_pipeline);
+        resources.insert(ScaleFactor(window.scale_factor()));
 
         let obj_model_id = world.push((obj_model,));
 
@@ -550,15 +625,15 @@ impl State {
             if let Some(surface) = self.resources.get::<wgpu::Surface>() {
                 surface.configure(&device, &self.config)
             };
-            
+
             if let Some(mut texture) = self.resources.get_mut::<texture::Texture>() {
-                *texture = texture::Texture::create_depth_texture(
-                    &device,
-                    &self.config,
-                    "depth_texture",
-                );
+                *texture =
+                    texture::Texture::create_depth_texture(&device, &self.config, "depth_texture");
             }
-            
+
+            if let Some(mut res) = self.resources.get_mut::<EguiResources>() {
+                res.size = new_size;
+            }
         }
     }
 
@@ -596,16 +671,57 @@ impl State {
     }
 }
 
+struct DeltaTime(std::time::Duration);
+struct InstantApplicationStart(std::time::Instant);
+
 #[tokio::main]
 async fn main() {
     env_logger::init();
-    let event_loop = EventLoop::new();
+    let event_loop = EventLoop::with_user_event();
     let title = env!("CARGO_PKG_NAME");
     let window = winit::window::WindowBuilder::new()
         .with_title(title)
+        .with_decorations(true)
         .build(&event_loop)
         .unwrap();
+
     let mut state = State::new(&window).await; // NEW!
+
+    let platform = egui_winit_platform::Platform::new(PlatformDescriptor {
+        physical_width: state.size.width as u32,
+        physical_height: state.size.height as u32,
+        scale_factor: window.scale_factor(),
+        font_definitions: FontDefinitions::default(),
+        style: Default::default(),
+    });
+
+    let egui_rpass = {
+        let device = state.resources.get::<wgpu::Device>().unwrap();
+        let adapter = state.resources.get::<wgpu::Adapter>().unwrap();
+        let surface_format = state
+            .resources
+            .get::<wgpu::Surface>()
+            .unwrap()
+            .get_preferred_format(&adapter)
+            .unwrap();
+        egui_wgpu_backend::RenderPass::new(&device, surface_format, 1)
+    };
+
+    let repaint_signal = std::sync::Arc::new(RenderRepaintSignal(std::sync::Mutex::new(
+        event_loop.create_proxy(),
+    )));
+
+    let app = EguiApp::default();
+
+    state.resources.insert(EguiResources {
+        egui_rpass,
+        egui_platform: platform,
+        start_time: InstantApplicationStart(std::time::Instant::now()),
+        repaint_signal,
+        size: state.size,
+        app,
+    });
+
     let mut last_render_time = std::time::Instant::now();
 
     let mut schedule = legion::Schedule::builder()
@@ -615,21 +731,32 @@ async fn main() {
         .build();
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
+        state.resources.get_mut::<EguiResources>().unwrap().egui_platform.handle_event(&event);
         match event {
-            Event::MainEventsCleared => window.request_redraw(),
-            Event::DeviceEvent {
+            winit::event::Event::RedrawRequested(..) => {
+                let now = std::time::Instant::now();
+                let dt = now - last_render_time;
+                state.resources.insert(DeltaTime(dt));
+                last_render_time = now;
+
+                schedule.execute(&mut state.world, &mut state.resources);
+            }
+            winit::event::Event::MainEventsCleared | winit::event::Event::UserEvent(Event::RequestRedraw) => {
+                window.request_redraw();
+            }
+            winit::event::Event::DeviceEvent {
                 ref event,
                 .. // We're not using device_id currently
             } => {
                 state.input(event);
             }
-            Event::WindowEvent {
+            WindowEvent {
                 ref event,
                 window_id,
             } if window_id == window.id() => {
                 match event {
-                    WindowEvent::CloseRequested
-                    | WindowEvent::KeyboardInput {
+                    winit::event::WindowEvent::CloseRequested
+                    | winit::event::WindowEvent::KeyboardInput {
                         input:
                             KeyboardInput {
                                 state: ElementState::Pressed                                ,
@@ -638,22 +765,18 @@ async fn main() {
                             },
                         ..
                     } => *control_flow = ControlFlow::Exit,
-                    WindowEvent::Resized(physical_size) => {
+                    winit::event::WindowEvent::Resized(physical_size) => {
                         state.resize(*physical_size);
                     }
-                    WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
+                    winit::event::WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
                         state.resize(**new_inner_size);
                     }
                     _ => {}
                 }
             }
-            Event::RedrawRequested(_) => {
-                let now = std::time::Instant::now();
-                let dt = now - last_render_time;
-                state.resources.insert(dt);
-                last_render_time = now;
-                schedule.execute(&mut state.world, &mut state.resources);
-            }
+            // Event::RedrawRequested(_) => {
+                
+            // }
             _ => {}
         }
     });
@@ -664,7 +787,7 @@ async fn main() {
 fn update(
     world: &mut legion::world::SubWorld,
     query: &mut Query<&mut LightInformation>,
-    #[resource] dt: &std::time::Duration,
+    #[resource] DeltaTime(dt): &DeltaTime,
     #[resource] queue: &wgpu::Queue,
     #[resource] camera: &mut camera::Camera,
     #[resource] camera_controller: &mut camera::CameraController,
@@ -695,6 +818,27 @@ fn update(
     })
 }
 
+enum Event {
+    RequestRedraw,
+}
+
+struct RenderRepaintSignal(std::sync::Mutex<winit::event_loop::EventLoopProxy<Event>>);
+
+impl epi::RepaintSignal for RenderRepaintSignal {
+    fn request_repaint(&self) {
+        self.0.lock().unwrap().send_event(Event::RequestRedraw).ok();
+    }
+}
+
+struct EguiResources {
+    egui_platform: egui_winit_platform::Platform,
+    egui_rpass: egui_wgpu_backend::RenderPass,
+    start_time: InstantApplicationStart,
+    repaint_signal: std::sync::Arc<RenderRepaintSignal>,
+    size: winit::dpi::PhysicalSize<u32>,
+    app: EguiApp,
+}
+
 #[allow(clippy::too_many_arguments)]
 #[system]
 fn render(
@@ -708,6 +852,15 @@ fn render(
     #[resource] (_, _, camera_bind_group): &CameraRenderInformation,
     #[resource] render_pipeline: &wgpu::RenderPipeline,
     #[resource] queue: &wgpu::Queue,
+    #[resource] EguiResources {
+        egui_platform,
+        egui_rpass,
+        start_time,
+        repaint_signal,
+        size,
+        app,
+    }: &mut EguiResources,
+    #[resource] DeltaTime(dt): &DeltaTime,
 ) {
     let result: anyhow::Result<()> = (|| {
         let output = surface.get_current_texture()?;
@@ -771,6 +924,45 @@ fn render(
                     &light_info.light_bind_group,
                 );
             }
+        }
+
+        {
+            egui_platform.begin_frame();
+
+            let mut app_output = epi::backend::AppOutput::default();
+
+            let mut frame = epi::backend::FrameBuilder {
+                info: epi::IntegrationInfo {
+                    web_info: None,
+                    cpu_usage: Some(dt.as_secs_f32()),
+                    name: "Test",
+                    native_pixels_per_point: Some(start_time.0.elapsed().as_secs_f32()),
+                    prefer_dark_mode: Some(true),
+                },
+                tex_allocator: egui_rpass,
+                output: &mut app_output,
+                repaint_signal: repaint_signal.clone(),
+            }
+            .build();
+
+            app.update(&egui_platform.context(), &mut frame);
+
+            let (_output, paint_commands) = egui_platform.end_frame(None); // NOTE: Some(window) should be correct here
+            let paint_jobs = egui_platform.context().tessellate(paint_commands);
+
+            let screen_descriptor = egui_wgpu_backend::ScreenDescriptor {
+                physical_width: size.width,
+                physical_height: size.height,
+                scale_factor: 1.0, // NOTE: THIS WORKS, BUT IS TECHNICALLY NOT CORRECT
+            };
+
+            egui_rpass.update_texture(device, queue, &egui_platform.context().texture());
+            egui_rpass.update_user_textures(device, queue);
+            egui_rpass.update_buffers(device, queue, &paint_jobs, &screen_descriptor);
+
+            egui_rpass
+                .execute(&mut encoder, &view, &paint_jobs, &screen_descriptor, None)
+                .unwrap();
         }
         queue.submit(std::iter::once(encoder.finish()));
         output.present();
